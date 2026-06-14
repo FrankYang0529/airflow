@@ -22,8 +22,11 @@ import os
 from contextlib import redirect_stdout
 from io import StringIO
 
+import httpx
 import pytest
 import yaml
+from airflowctl.api.datamodels.generated import VariableResponse
+from airflowctl.api.operations import ServerResponseError
 from sqlalchemy import select
 
 from airflow import models
@@ -35,6 +38,12 @@ from airflow.utils.session import create_session
 from tests_common.test_utils.db import clear_db_variables
 
 pytestmark = pytest.mark.db_test
+
+
+def _server_error(status_code: int) -> ServerResponseError:
+    request = httpx.Request("GET", "http://testserver/api/v2/variables/foo")
+    response = httpx.Response(status_code, request=request, json={"detail": "boom"})
+    return ServerResponseError(message="boom", request=request, response=response)
 
 
 # Test data fixtures
@@ -129,28 +138,63 @@ class TestCliVariables:
     def teardown_method(self):
         clear_db_variables()
 
-    def test_variables_set(self):
-        """Test variable_set command"""
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo", "bar"]))
-        assert Variable.get("foo") is not None
-        with pytest.raises(KeyError):
-            Variable.get("foo1")
+    def test_variables_set_creates_when_missing(self, mock_cli_api_client):
+        """``set`` creates the variable when it does not yet exist."""
+        mock_cli_api_client.variables.get.side_effect = _server_error(404)
 
-    def test_variables_set_with_description(self):
-        """Test variable_set command with optional description argument"""
-        expected_var_desc = "foo_bar_description"
-        var_key = "foo"
-        variable_command.variables_set(
-            self.parser.parse_args(["variables", "set", var_key, "bar", "--description", expected_var_desc])
+        variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo", "bar"]))
+
+        mock_cli_api_client.variables.create.assert_called_once()
+        mock_cli_api_client.variables.update.assert_not_called()
+        body = mock_cli_api_client.variables.create.call_args.kwargs["variable"]
+        assert body.key == "foo"
+        assert body.value == "bar"
+        assert body.description is None
+
+    def test_variables_set_updates_when_exists(self, mock_cli_api_client):
+        """``set`` updates the variable when it already exists."""
+        mock_cli_api_client.variables.get.return_value = VariableResponse(
+            key="foo", value="old", is_encrypted=False
         )
 
-        assert Variable.get(var_key) == "bar"
-        with create_session() as session:
-            actual_var_desc = session.scalar(select(Variable.description).where(Variable.key == var_key))
-            assert actual_var_desc == expected_var_desc
+        variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo", "new"]))
 
-        with pytest.raises(KeyError):
-            Variable.get("foo1")
+        mock_cli_api_client.variables.update.assert_called_once()
+        mock_cli_api_client.variables.create.assert_not_called()
+        body = mock_cli_api_client.variables.update.call_args.kwargs["variable"]
+        assert body.key == "foo"
+        assert body.value == "new"
+
+    def test_variables_set_with_description(self, mock_cli_api_client):
+        """``set`` forwards the optional description to the client."""
+        mock_cli_api_client.variables.get.side_effect = _server_error(404)
+
+        variable_command.variables_set(
+            self.parser.parse_args(["variables", "set", "foo", "bar", "--description", "foo_bar_description"])
+        )
+
+        body = mock_cli_api_client.variables.create.call_args.kwargs["variable"]
+        assert body.key == "foo"
+        assert body.value == "bar"
+        assert body.description == "foo_bar_description"
+
+    def test_variables_set_serialize_json(self, mock_cli_api_client):
+        """``--json`` serializes the value before sending it."""
+        mock_cli_api_client.variables.get.side_effect = _server_error(404)
+
+        variable_command.variables_set(
+            self.parser.parse_args(["variables", "set", "foo", '{"a": 1}', "--json"])
+        )
+
+        body = mock_cli_api_client.variables.create.call_args.kwargs["variable"]
+        assert body.key == "foo"
+        assert body.value == json.dumps('{"a": 1}', indent=2)
+
+    def test_variables_set_reraises_non_404_error(self, mock_cli_api_client):
+        """Errors other than 404 from the existence check propagate."""
+        mock_cli_api_client.variables.get.side_effect = _server_error(500)
+        with pytest.raises(ServerResponseError):
+            variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo", "bar"]))
 
     def test_variables_get(self, stdout_capture):
         Variable.set("foo", {"foo": "bar"}, serialize_json=True)
@@ -171,25 +215,19 @@ class TestCliVariables:
             variable_command.variables_get(self.parser.parse_args(["variables", "get", "no-existing-VAR"]))
 
     def test_variables_set_different_types(self):
-        """Test storage of various data types"""
-        # Set a dict
-        variable_command.variables_set(
-            self.parser.parse_args(["variables", "set", "dict", '{"foo": "oops"}'])
-        )
-        # Set a list
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "list", '["oops"]']))
-        # Set str
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "str", "hello string"]))
-        # Set int
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "int", "42"]))
-        # Set float
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "float", "42.0"]))
-        # Set true
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "true", "true"]))
-        # Set false
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "false", "false"]))
-        # Set none
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "null", "null"]))
+        """Test export/import round-trips storage of various data types.
+
+        ``set`` is migrated to the airflowctl client, so the variables are seeded directly
+        through the model here; ``export``/``import`` remain local DB commands.
+        """
+        Variable.set("dict", '{"foo": "oops"}')
+        Variable.set("list", '["oops"]')
+        Variable.set("str", "hello string")
+        Variable.set("int", "42")
+        Variable.set("float", "42.0")
+        Variable.set("true", "true")
+        Variable.set("false", "false")
+        Variable.set("null", "null")
 
         # Export and then import
         variable_command.variables_export(
@@ -210,8 +248,8 @@ class TestCliVariables:
         assert Variable.get("null", deserialize_json=True) is None
 
         # test variable import skip existing
-        # set varliable list to ["airflow"] and have it skip during import
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "list", '["airflow"]']))
+        # set variable list to ["airflow"] and have it skip during import
+        Variable.set("list", '["airflow"]')
         variable_command.variables_import(
             self.parser.parse_args(
                 ["variables", "import", "variables_types.json", "--action-on-existing-key", "skip"]
@@ -325,8 +363,8 @@ class TestCliVariables:
                 assert item["val"] == "***"
 
     def test_variables_delete(self):
-        """Test variable_delete command"""
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo", "bar"]))
+        """Test variable_delete command (``set`` is migrated, so seed via the model)"""
+        Variable.set("foo", "bar")
         variable_command.variables_delete(self.parser.parse_args(["variables", "delete", "foo"]))
         with pytest.raises(KeyError):
             Variable.get("foo")
@@ -365,13 +403,13 @@ class TestCliVariables:
         path1 = tmp_path / "testfile1.json"
         path2 = tmp_path / "testfile2.json"
 
-        # First export
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo", '{"foo":"bar"}']))
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "bar", "original"]))
+        # First export (``set`` is migrated to airflowctl, so seed via the model)
+        Variable.set("foo", '{"foo":"bar"}')
+        Variable.set("bar", "original")
         variable_command.variables_export(self.parser.parse_args(["variables", "export", os.fspath(path1)]))
 
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "bar", "updated"]))
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo", '{"foo":"oops"}']))
+        Variable.set("bar", "updated")
+        Variable.set("foo", '{"foo":"oops"}')
         variable_command.variables_delete(self.parser.parse_args(["variables", "delete", "foo"]))
         with create_session() as session:
             variable_command.variables_import(
@@ -389,13 +427,10 @@ class TestCliVariables:
     def test_variables_import_and_export_with_description(self, tmp_path):
         """Test variables_import with file-description parameter"""
         variables_types_file = tmp_path / "variables_types.json"
-        variable_command.variables_set(
-            self.parser.parse_args(["variables", "set", "foo", "bar", "--description", "Foo var description"])
-        )
-        variable_command.variables_set(
-            self.parser.parse_args(["variables", "set", "foo1", "bar1", "--description", "12"])
-        )
-        variable_command.variables_set(self.parser.parse_args(["variables", "set", "foo2", "bar2"]))
+        # ``set`` is migrated to airflowctl, so seed the variables via the model
+        Variable.set("foo", "bar", description="Foo var description")
+        Variable.set("foo1", "bar1", description="12")
+        Variable.set("foo2", "bar2")
         variable_command.variables_export(
             self.parser.parse_args(["variables", "export", os.fspath(variables_types_file)])
         )

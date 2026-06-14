@@ -30,10 +30,32 @@ from airflowctl.api.datamodels.generated import (
     BulkCreateActionVariableBody,
     VariableBody,
 )
+from airflowctl.api.operations import ServerResponseError
 
 
 def _print_file_error(message: str, file_path: str) -> None:
     Console().print(f"[red]{message}: {file_path}", soft_wrap=True)
+
+
+@provide_api_client(kind=ClientKind.CLI)
+def set_(args, api_client=NEW_API_CLIENT) -> None:
+    """Set a variable, creating it if it does not exist and updating it otherwise."""
+    value = args.value
+    if args.serialize_json:
+        value = json.dumps(value)
+    variable_body = VariableBody(key=args.key, value=value, description=args.description)
+
+    try:
+        api_client.variables.get(variable_key=args.key)
+    except ServerResponseError as e:
+        if e.response.status_code == 404:
+            api_client.variables.create(variable=variable_body)
+            rich.print(f"[green]Variable {args.key} created[/green]")
+            return
+        raise
+
+    api_client.variables.update(variable=variable_body)
+    rich.print(f"[green]Variable {args.key} updated[/green]")
 
 
 @provide_api_client(kind=ClientKind.CLI)

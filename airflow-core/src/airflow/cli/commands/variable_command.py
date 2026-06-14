@@ -23,10 +23,13 @@ import json
 import os
 from typing import TYPE_CHECKING
 
+from airflowctl.api.operations import ServerResponseError
 from sqlalchemy import select
 
+from airflow.api_fastapi.core_api.datamodels.variables import VariableBody
+from airflow.cli.api_client import NEW_API_CLIENT, Client, provide_api_client
 from airflow.cli.simple_table import AirflowConsole
-from airflow.cli.utils import SENSITIVE_PLACEHOLDER, print_export_output
+from airflow.cli.utils import SENSITIVE_PLACEHOLDER, deprecated_for_airflowctl, print_export_output
 from airflow.exceptions import (
     AirflowFileParseException,
     AirflowUnsupportedFileTypeException,
@@ -108,11 +111,24 @@ def variables_get(args):
 
 
 @cli_utils.action_cli
+@deprecated_for_airflowctl("airflowctl variables set")
+@suppress_logs_and_warning
 @providers_configuration_loaded
-def variables_set(args):
-    """Create new variable with a given name, value and description."""
-    Variable.set(args.key, args.value, args.description, serialize_json=args.json)
-    print(f"Variable {args.key} created")
+@provide_api_client
+def variables_set(args, api_client: Client = NEW_API_CLIENT):
+    """Set a variable, creating it if it does not exist and updating it otherwise."""
+    value = json.dumps(args.value, indent=2) if args.json else args.value
+    variable_body = VariableBody(key=args.key, value=value, description=args.description)
+    try:
+        api_client.variables.get(variable_key=args.key)
+    except ServerResponseError as e:
+        if e.response.status_code == 404:
+            api_client.variables.create(variable=variable_body)  # type: ignore[arg-type]
+            print(f"Variable {args.key} created")
+            return
+        raise
+    api_client.variables.update(variable=variable_body)  # type: ignore[arg-type]
+    print(f"Variable {args.key} updated")
 
 
 @cli_utils.action_cli

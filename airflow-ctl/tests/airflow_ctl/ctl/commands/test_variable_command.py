@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest import mock
 
+import httpx
 import pytest
 
 from airflowctl.api.client import ClientKind
@@ -28,8 +30,15 @@ from airflowctl.api.datamodels.generated import (
     VariableCollectionResponse,
     VariableResponse,
 )
+from airflowctl.api.operations import ServerResponseError
 from airflowctl.ctl import cli_parser
 from airflowctl.ctl.commands import variable_command
+
+
+def _server_error(status_code: int) -> ServerResponseError:
+    request = httpx.Request("GET", "http://testserver/api/v2/variables/key")
+    response = httpx.Response(status_code, request=request, json={"detail": "boom"})
+    return ServerResponseError(message="boom", request=request, response=response)
 
 
 class TestCliVariableCommands:
@@ -62,6 +71,75 @@ class TestCliVariableCommands:
         update=None,
         delete=None,
     )
+
+    def test_set_creates_when_missing(self):
+        """When the key does not exist, ``set`` falls back to creating it."""
+        api_client = mock.MagicMock()
+        api_client.variables.get.side_effect = _server_error(404)
+
+        variable_command.set_(
+            self.parser.parse_args(["variables", "set", "new_key", "new_value"]),
+            api_client=api_client,
+        )
+
+        api_client.variables.create.assert_called_once()
+        api_client.variables.update.assert_not_called()
+        body = api_client.variables.create.call_args.kwargs["variable"]
+        assert body.key == "new_key"
+        assert body.value.root == "new_value"
+
+    def test_set_updates_when_exists(self):
+        """When the key already exists, ``set`` updates it instead of creating."""
+        api_client = mock.MagicMock()
+        api_client.variables.get.return_value = self.variable_collection_response.variables[0]
+
+        variable_command.set_(
+            self.parser.parse_args(["variables", "set", self.key, "updated_value"]),
+            api_client=api_client,
+        )
+
+        api_client.variables.update.assert_called_once()
+        api_client.variables.create.assert_not_called()
+        body = api_client.variables.update.call_args.kwargs["variable"]
+        assert body.key == self.key
+        assert body.value.root == "updated_value"
+
+    def test_set_serialize_json(self):
+        """``--serialize-json`` JSON-encodes the value before sending it."""
+        api_client = mock.MagicMock()
+        api_client.variables.get.side_effect = _server_error(404)
+
+        variable_command.set_(
+            self.parser.parse_args(["variables", "set", "json_key", '{"a": 1}', "--serialize-json"]),
+            api_client=api_client,
+        )
+
+        body = api_client.variables.create.call_args.kwargs["variable"]
+        assert body.value.root == json.dumps('{"a": 1}')
+
+    def test_set_forwards_description(self):
+        """``--description`` is forwarded to the created variable."""
+        api_client = mock.MagicMock()
+        api_client.variables.get.side_effect = _server_error(404)
+
+        variable_command.set_(
+            self.parser.parse_args(["variables", "set", "key", "value", "--description", "a description"]),
+            api_client=api_client,
+        )
+
+        body = api_client.variables.create.call_args.kwargs["variable"]
+        assert body.description == "a description"
+
+    def test_set_reraises_non_404_error(self):
+        """Errors other than 404 from the existence check propagate."""
+        api_client = mock.MagicMock()
+        api_client.variables.get.side_effect = _server_error(500)
+
+        with pytest.raises(ServerResponseError):
+            variable_command.set_(
+                self.parser.parse_args(["variables", "set", "key", "value"]),
+                api_client=api_client,
+            )
 
     def test_import_success(self, api_client_maker, tmp_path, monkeypatch):
         api_client = api_client_maker(
