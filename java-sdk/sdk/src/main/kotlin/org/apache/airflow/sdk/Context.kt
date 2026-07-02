@@ -19,17 +19,62 @@
 
 package org.apache.airflow.sdk
 
+import org.apache.airflow.sdk.execution.Logger
 import org.apache.airflow.sdk.execution.comm.StartupDetails
+import java.time.OffsetDateTime
+
+private val logger = Logger(Context::class)
+
+/**
+ * Convert a run-context value to [OffsetDateTime]. A value that is present
+ * but cannot be interpreted is logged and dropped to `null`.
+ */
+private fun Any?.toDateTime(): OffsetDateTime? =
+  when (this) {
+    null -> null
+    is OffsetDateTime -> this
+    is String ->
+      runCatching { OffsetDateTime.parse(this) }.getOrElse {
+        logger.warn("Ignoring unparsable date-time in run context", mapOf("value" to this))
+        null
+      }
+    else -> {
+      logger.warn("Ignoring unexpected date-time value in run context", mapOf("value" to toString()))
+      null
+    }
+  }
+
+private fun Any?.toConf(): Map<String, Any?> =
+  when (this) {
+    null -> emptyMap()
+    is Map<*, *> -> entries.mapNotNull { (key, value) -> (key as? String)?.let { it to value } }.toMap()
+    else -> {
+      logger.warn("Ignoring unexpected conf value in run context", mapOf("value" to toString()))
+      emptyMap()
+    }
+  }
 
 /**
  * Identifies the Dag run that the current task instance belongs to.
  *
  * @property dagId ID of the Dag being run.
  * @property runId Unique identifier for this Dag run.
+ * @property logicalDate A date-time that logically identifies the current Dag run.
+ * @property dataIntervalStart Start of the data interval.
+ * @property dataIntervalEnd End of the data interval.
+ * @property runAfter A date-time tells the scheduler when the Dag run can be scheduled.
+ * @property runType How the run was created.
+ * @property conf The configuration for this run.
  */
 data class DagRun(
   @JvmField val dagId: String,
   @JvmField val runId: String,
+  @JvmField val logicalDate: OffsetDateTime?,
+  @JvmField val dataIntervalStart: OffsetDateTime?,
+  @JvmField val dataIntervalEnd: OffsetDateTime?,
+  @JvmField val runAfter: OffsetDateTime?,
+  @JvmField val runType: String?,
+  @JvmField val conf: Map<String, Any?>,
 )
 
 /**
@@ -65,7 +110,19 @@ data class Context(
   internal companion object {
     fun from(request: StartupDetails) =
       Context(
-        dagRun = with(request.tiContext.dagRun) { DagRun(dagId, runId) },
+        dagRun =
+          with(request.tiContext.dagRun) {
+            DagRun(
+              dagId = dagId,
+              runId = runId,
+              logicalDate = logicalDate.toDateTime(),
+              dataIntervalStart = dataIntervalStart.toDateTime(),
+              dataIntervalEnd = dataIntervalEnd.toDateTime(),
+              runAfter = runAfter.toDateTime(),
+              runType = runType?.toString(),
+              conf = conf.toConf(),
+            )
+          },
         ti = with(request.ti) { TaskInstance(dagId, runId, taskId, mapIndex, tryNumber) },
       )
   }
